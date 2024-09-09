@@ -42,6 +42,7 @@ val osVersion by lazy {
         Build.VERSION_CODES.TIRAMISU -> 130000
         Build.VERSION_CODES.S_V2 -> 120100
         Build.VERSION_CODES.S -> 120000
+        Build.VERSION_CODES.R -> 110000
         else -> 0
     }
 }
