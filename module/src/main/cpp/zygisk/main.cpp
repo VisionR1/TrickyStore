@@ -1,303 +1,366 @@
 #include <android/log.h>
-#include <array>
-#include <cstdlib>
-#include <fcntl.h>
-#include <jni.h>
-#include <memory>
-#include <string_view>
-#include <sys/stat.h>
-#include <tuple>
+#include <sys/system_properties.h>
 #include <unistd.h>
-#include <utility>
+#include <vector>
+#include <map>
+#include <string>
+#include <fstream>  // For file I/O
+#include <sstream> // For string streams
 
-#include "logging.hpp"
 #include "zygisk.hpp"
+#include "json/single_include/nlohmann/json.hpp"
+#include "dobby.h"
 
-using zygisk::Api;
-using zygisk::AppSpecializeArgs;
-using zygisk::ServerSpecializeArgs;
-using namespace std::string_view_literals;
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "PIF/Native", __VA_ARGS__)
 
-template <size_t N> struct FixedString {
-    // NOLINTNEXTLINE(*-explicit-constructor)
-    [[maybe_unused]] consteval inline FixedString(const char (&str)[N]) {
-        std::copy_n(str, N, data);
-    }
-    consteval inline FixedString() = default;
-    char data[N] = {};
-};
+#define DEX_FILE_PATH "/data/adb/modules/playintegrityfix/classes.dex"
 
-using PropValue = std::array<char, 127>;
+#define JSON_FILE_PATH "/data/adb/modules/playintegrityfix/pif.json"
+#define CUSTOM_JSON_FILE_PATH "/data/adb/modules/playintegrityfix/custom.pif.json"
+#define TARGET_LIST_FILE "/data/adb/modules/playintegrityfix/target.txt" // Path to target.txt
 
-template<typename T, FixedString Field, bool Version=false>
-struct Prop {
-    using Type [[maybe_unused]] = T;
-    bool has_value{false};
-    PropValue value {};
+static int verboseLogs = 0;
+static int spoofBuild = 1;
+static int spoofProps = 1;
+static int spoofProvider = 1;
+static int spoofSignature = 0;
 
-    [[maybe_unused]] inline consteval static const char *getField() {
-        return Field.data;
-    }
-    [[maybe_unused]] inline consteval static bool isVersion() {
-        return Version;
-    }
-};
+static std::map<std::string, std::string> jsonProps;
 
-static_assert(sizeof(Prop<void, "", false>) % sizeof(void*) == 0);
+typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 
-using SpoofConfig = std::tuple<
-    Prop<jstring, "MANUFACTURER">,
-    Prop<jstring, "MODEL">,
-    Prop<jstring, "FINGERPRINT">,
-    Prop<jstring, "BRAND">,
-    Prop<jstring, "PRODUCT">,
-    Prop<jstring, "DEVICE">,
-    Prop<jstring, "RELEASE", true>,
-    Prop<jstring, "ID">,
-    Prop<jstring, "INCREMENTAL", true>,
-    Prop<jstring, "TYPE">,
-    Prop<jstring, "TAGS">,
-    Prop<jstring, "SECURITY_PATCH", true>,
-    Prop<jstring, "BOARD">,
-    Prop<jstring, "HARDWARE">,
-    Prop<jint, "DEVICE_INITIAL_SDK_INT", true>
->;
+static std::map<void *, T_Callback> callbacks;
 
+static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
+    if (cookie == nullptr || name == nullptr || value == nullptr || !callbacks.contains(cookie)) return;
+    const char *oldValue = value;
 
-ssize_t xread(int fd, void *buffer, size_t count) {
-    ssize_t total = 0;
-    char *buf = (char *)buffer;
-    while (count > 0) {
-        ssize_t ret = read(fd, buf, count);
-        if (ret < 0) return -1;
-        buf += ret;
-        total += ret;
-        count -= ret;
-    }
-    return total;
-}
+    std::string prop(name);
 
-ssize_t xwrite(int fd, const void *buffer, size_t count) {
-    ssize_t total = 0;
-    char *buf = (char *)buffer;
-    while (count > 0) {
-        ssize_t ret = write(fd, buf, count);
-        if (ret < 0) return -1;
-        buf += ret;
-        total += ret;
-        count -= ret;
-    }
-    return total;
-}
-
-void trim(std::string_view &str) {
-    str.remove_prefix(std::min(str.find_first_not_of(" \t"), str.size()));
-    str.remove_suffix(std::min(str.size() - str.find_last_not_of(" \t") - 1, str.size()));
-}
-
-class TrickyStore : public zygisk::ModuleBase {
-public:
-    void onLoad(Api *api, JNIEnv *env) override {
-        this->api_ = api;
-        this->env_ = env;
+    // Spoof specific property values
+    if (prop == "init.svc.adbd") {
+        value = "stopped";
+    } else if (prop == "sys.usb.state") {
+        value = "mtp";
     }
 
-    void preAppSpecialize(AppSpecializeArgs *args) override {
-        api_->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-        if (args->app_data_dir == nullptr) {
-            return;
-        }
-
-        auto app_data_dir = env_->GetStringUTFChars(args->app_data_dir, nullptr);
-        auto nice_name = env_->GetStringUTFChars(args->nice_name, nullptr);
-
-        std::string_view dir(app_data_dir);
-        std::string_view process(nice_name);
-
-        bool isGms = false, isGmsUnstable = false;
-        isGms = dir.ends_with("/com.google.android.gms");
-        isGmsUnstable = process == "com.google.android.gms.unstable";
-
-        env_->ReleaseStringUTFChars(args->app_data_dir, app_data_dir);
-        env_->ReleaseStringUTFChars(args->nice_name, nice_name);
-
-        if (!isGms) {
-            return;
-        }
-        api_->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
-        if (!isGmsUnstable) {
-            return;
-        }
-        
-        int enabled = 0;
-        SpoofConfig spoofConfig{};
-        auto fd = api_->connectCompanion();
-        if (fd >= 0) [[likely]] {
-            // read enabled
-            xread(fd, &enabled, sizeof(enabled));
-            if (enabled) {
-                xread(fd, &spoofConfig, sizeof(spoofConfig));
+    if (jsonProps.count(prop)) {
+        // Exact property match
+        value = jsonProps[prop].c_str();
+    } else {
+        // Leading * wildcard property match
+        for (const auto &p : jsonProps) {
+            if (p.first.starts_with("*") && prop.ends_with(p.first.substr(1))) {
+                value = p.second.c_str();
+                break;
             }
-            close(fd);
-        }
-        if (enabled) {
-            LOGI("spoofing build vars in GMS!");
-            auto buildClass = env_->FindClass("android/os/Build");
-            auto buildVersionClass = env_->FindClass("android/os/Build$VERSION");
-
-            std::apply([this, &buildClass, &buildVersionClass](auto &&... args) {
-                ((!args.has_value ||
-                  (setField<typename std::remove_cvref_t<decltype(args)>::Type>(
-                          std::remove_cvref_t<decltype(args)>::isVersion() ? buildVersionClass
-                                                                           : buildClass,
-                          std::remove_cvref_t<decltype(args)>::getField(),
-                          args.value) &&
-                   (LOGI("%s set %s to %s",
-                         std::remove_cvref_t<decltype(args)>::isVersion() ? "VERSION" : "Build",
-                         std::remove_cvref_t<decltype(args)>::getField(),
-                         args.value.data()), true))
-                  ? void(0)
-                  : LOGE("%s failed to set %s to %s",
-                         std::remove_cvref_t<decltype(args)>::isVersion() ? "VERSION" : "Build",
-                         std::remove_cvref_t<decltype(args)>::getField(),
-                         args.value.data())), ...);
-            }, spoofConfig);
         }
     }
 
-    void preServerSpecialize(ServerSpecializeArgs *args) override {
-        api_->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+    if (oldValue == value) {
+        if (verboseLogs > 99) LOGD("[%s]: %s (unchanged)", name, oldValue);
+    } else {
+        LOGD("[%s]: %s -> %s", name, oldValue, value);
+    }
+
+    return callbacks[cookie](cookie, name, value, serial);
+}
+
+static void (*o_system_property_read_callback)(const prop_info *, T_Callback, void *);
+static void my_system_property_read_callback(const prop_info *pi, T_Callback callback, void *cookie) {
+    if (pi == nullptr || callback == nullptr || cookie == nullptr) {
+        return o_system_property_read_callback(pi, callback, cookie);
+    }
+    callbacks[cookie] = callback;
+    return o_system_property_read_callback(pi, modify_callback, cookie);
+}
+
+static void doHook() {
+    void *handle = DobbySymbolResolver(nullptr, "__system_property_read_callback");
+    if (handle == nullptr) {
+        LOGD("Couldn't find '__system_property_read_callback' handle");
+        return;
+    }
+    LOGD("Found '__system_property_read_callback' handle at %p", handle);
+    DobbyHook(handle, reinterpret_cast<dobby_dummy_func_t>(my_system_property_read_callback),
+              reinterpret_cast<dobby_dummy_func_t *>(&o_system_property_read_callback));
+}
+
+class PlayIntegrityFix : public zygisk::ModuleBase {
+public:
+    void onLoad(zygisk::Api *api, JNIEnv *env) override {
+        this->api = api;
+        this->env = env;
+    }
+
+    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        bool shouldProcess = false;
+        auto rawProcess = env->GetStringUTFChars(args->nice_name, nullptr);
+        auto rawDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
+        // Prevent crash on apps with no data dir
+        if (rawDir == nullptr) {
+            env->ReleaseStringUTFChars(args->nice_name, rawProcess);
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        std::string_view process(rawProcess);
+        std::string_view dir(rawDir);
+
+        readTargetList(); // Read target list from file
+
+        // Check if the target package is in the list
+        for (const auto &target : targetPackages) {
+            if (process == target || dir.ends_with("/" + target)) {
+                shouldProcess = true;
+                break;
+            }
+        }
+
+        env->ReleaseStringUTFChars(args->nice_name, rawProcess);
+        env->ReleaseStringUTFChars(args->app_data_dir, rawDir);
+
+        if (!shouldProcess) {
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        // We are in VENDING now, force unmount
+        api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
+        if (!shouldProcess) {
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        std::vector<char> dexVector;
+        long dexSize = 0, jsonSize = 0;
+        int fd = api->connectCompanion();
+
+        read(fd, &dexSize, sizeof(long));
+        read(fd, &jsonSize, sizeof(long));
+        if (dexSize < 1) {
+            close(fd);
+            LOGD("Couldn't read dex file");
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        if (jsonSize < 1) {
+            close(fd);
+            LOGD("Couldn't read json file");
+            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
+        LOGD("Read from file descriptor for 'dex' -> %ld bytes", dexSize);
+        LOGD("Read from file descriptor for 'json' -> %ld bytes", jsonSize);
+
+        dexVector.resize(dexSize);
+        read(fd, dexVector.data(), dexSize);
+
+        std::vector<char> jsonVector(jsonSize);
+        read(fd, jsonVector.data(), jsonSize);
+        close(fd);
+
+        std::string jsonString(jsonVector.cbegin(), jsonVector.cend());
+        json = nlohmann::json::parse(jsonString, nullptr, false, true);
+
+        jsonVector.clear();
+        jsonString.clear();
+    }
+
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+        if (dexVector.empty() || json.empty()) return;
+        readJson();
+        if (spoofProps > 0) doHook();
+        inject();
+
+        dexVector.clear();
+        json.clear();
+        targetPackages.clear(); // Clear the target list after use
+    }
+
+    void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
+        api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
 
 private:
-    Api *api_{nullptr};
-    JNIEnv *env_{nullptr};
+    zygisk::Api *api = nullptr;
+    JNIEnv *env = nullptr;
+    std::vector<char> dexVector;
+    nlohmann::json json;
 
-    template<typename T>
-    inline bool setField(jclass clazz, const char* field, const PropValue& value);
+    // Target list - read from target.txt
+    static std::vector<std::string> targetPackages;
 
-    template<>
-    inline bool setField<jstring>(jclass clazz, const char* field, const PropValue& value) {
-        auto id = env_->GetStaticFieldID(clazz, field, "Ljava/lang/String;");
-        if (!id) return false;
-        env_->SetStaticObjectField(clazz, id, env_->NewStringUTF(value.data()));
-        return true;
+    void readTargetList() {
+        std::ifstream targetFile(TARGET_LIST_FILE);
+        if (!targetFile.is_open()) {
+            LOGD("Error opening target list file: %s", TARGET_LIST_FILE);
+            // Add a default target to prevent issues if the file is missing
+            targetPackages.push_back("com.android.vending");
+            return;
+        }
+
+        std::string line;
+        while (std::getline(targetFile, line)) {
+            // Remove any trailing whitespace
+            line.erase(line.find_last_not_of(" \t\n\r") + 1);
+            if (!line.empty()) {
+                targetPackages.push_back(line);
+                LOGD("Added target package: %s", line.c_str());
+            }
+        }
+        targetFile.close();
     }
 
-    template<>
-    inline bool setField<jint>(jclass clazz, const char* field, const PropValue& value) {
-        auto id = env_->GetStaticFieldID(clazz, field, "I");
-        if (!id) return false;
-        char *p = nullptr;
-        jint x = static_cast<jint>(strtol(value.data(), &p, 10));
-        if (p == value.data()) {
-            return false;
+    void readJson() {
+        LOGD("JSON contains %d keys!", static_cast<int>(json.size()));
+        // Verbose logging level
+        if (json.contains("verboseLogs")) {
+            if (!json["verboseLogs"].is_null() && json["verboseLogs"].is_string() && json["verboseLogs"] != "") {
+                verboseLogs = stoi(json["verboseLogs"].get<std::string>());
+                if (verboseLogs > 0) LOGD("Verbose logging (level %d) enabled!", verboseLogs);
+            } else {
+                LOGD("Error parsing verboseLogs!");
+            }
+            json.erase("verboseLogs");
         }
-        env_->SetStaticIntField(clazz, id, x);
-        return true;
+
+        // Advanced spoofing settings
+        if (json.contains("spoofBuild")) {
+            if (!json["spoofBuild"].is_null() && json["spoofBuild"].is_string() && json["spoofBuild"] != "") {
+                spoofBuild = stoi(json["spoofBuild"].get<std::string>());
+                if (verboseLogs > 0) LOGD("Spoofing Build Fields %s!", (spoofBuild > 0) ? "enabled" : "disabled");
+            } else {
+                LOGD("Error parsing spoofBuild!");
+            }
+            json.erase("spoofBuild");
+        }
+        if (json.contains("spoofProps")) {
+            if (!json["spoofProps"].is_null() && json["spoofProps"].is_string() && json["spoofProps"] != "") {
+                spoofProps = stoi(json["spoofProps"].get<std::string>());
+                if (verboseLogs > 0) LOGD("Spoofing System Properties %s!", (spoofProps > 0) ? "enabled" : "disabled");
+            } else {
+                LOGD("Error parsing spoofProps!");
+            }
+            json.erase("spoofProps");
+        }
+        if (json.contains("spoofProvider")) {
+            if (!json["spoofProvider"].is_null() && json["spoofProvider"].is_string() && json["spoofProvider"] != "") {
+                spoofProvider = stoi(json["spoofProvider"].get<std::string>());
+                if (verboseLogs > 0) LOGD("Spoofing Keystore Provider %s!", (spoofProvider > 0) ? "enabled" : "disabled");
+            } else {
+                LOGD("Error parsing spoofProvider!");
+            }
+            json.erase("spoofProvider");
+        }
+        if (json.contains("spoofSignature")) {
+            if (!json["spoofSignature"].is_null() && json["spoofSignature"].is_string() && json["spoofSignature"] != "") {
+                spoofSignature = stoi(json["spoofSignature"].get<std::string>());
+                if (verboseLogs > 0) LOGD("Spoofing ROM Signature %s!", (spoofSignature > 0) ? "enabled" : "disabled");
+            } else {
+                LOGD("Error parsing spoofSignature!");
+            }
+            json.erase("spoofSignature");
+        }
+
+        std::vector<std::string> eraseKeys;
+        for (auto &jsonList : json.items()) {
+            if (verboseLogs > 1) LOGD("Parsing %s", jsonList.key().c_str());
+            if (jsonList.key().find_first_of("*.") != std::string::npos) {
+                // Name contains .
+                // or * (wildcard) so assume real property name
+                if (!jsonList.value().is_null() && jsonList.value().is_string()) {
+                    if (jsonList.value() == "") {
+                        LOGD("%s is empty, skipping", jsonList.key().c_str());
+                    } else {
+                        if (verboseLogs > 0) LOGD("Adding '%s' to properties list", jsonList.key().c_str());
+                        jsonProps[jsonList.key()] = jsonList.value();
+                    }
+                } else {
+                    LOGD("Error parsing %s!", jsonList.key().c_str());
+                }
+                eraseKeys.push_back(jsonList.key());
+            }
+        }
+        // Remove properties from parsed JSON
+        for (auto key : eraseKeys) {
+            if (json.contains(key)) json.erase(key);
+        }
     }
 
-    template<>
-    inline bool setField<jboolean>(jclass clazz, const char* field, const PropValue& value) {
-        auto id = env_->GetStaticFieldID(clazz, field, "Z");
-        if (!id) return false;
-        auto x = std::string_view(value.data());
-        if (x == "1" || x == "true") {
-            env_->SetStaticBooleanField(clazz, id, JNI_TRUE);
-        } else if (x == "0" || x == "false") {
-            env_->SetStaticBooleanField(clazz, id, JNI_FALSE);
-        } else {
-            return false;
-        }
-        return true;
+    void inject() {
+        LOGD("JNI: Getting system classloader");
+        auto clClass = env->FindClass("java/lang/ClassLoader");
+        auto getSystemClassLoader = env->GetStaticMethodID(clClass, "getSystemClassLoader", "()Ljava/lang/ClassLoader;");
+        auto systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
+
+        LOGD("JNI: Creating module classloader");
+        auto dexClClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
+        auto dexClInit = env->GetMethodID(dexClClass, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+        auto buffer = env->NewDirectByteBuffer(dexVector.data(), static_cast<jlong>(dexVector.size()));
+        auto dexCl = env->NewObject(dexClClass, dexClInit, buffer, systemClassLoader);
+
+        LOGD("JNI: Loading module class");
+        auto loadClass = env->GetMethodID(clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        auto entryClassName = env->NewStringUTF("es.chiteroman.playintegrityfix.EntryPoint");
+        auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
+
+        auto entryClass = (jclass) entryClassObj;
+
+        LOGD("JNI: Sending JSON");
+        auto receiveJson = env->GetStaticMethodID(entryClass, "receiveJson", "(Ljava/lang/String;)V");
+        auto javaStr = env->NewStringUTF(json.dump().c_str());
+        env->CallStaticVoidMethod(entryClass, receiveJson, javaStr);
+
+        LOGD("JNI: Calling init");
+        auto entryInit = env->GetStaticMethodID(entryClass, "init", "(IIII)V");
+        env->CallStaticVoidMethod(entryClass, entryInit, verboseLogs, spoofBuild, spoofProvider, spoofSignature);
     }
 };
 
-void read_config(FILE *config, SpoofConfig &spoof_config) {
-    char *l = nullptr;
-    struct finally {
-        char *(&l);
+static void companion(int fd) {
+    long dexSize = 0, jsonSize = 0;
+    std::vector<char> dexVector, jsonVector;
+    FILE *dex = fopen(DEX_FILE_PATH, "rb");
 
-        ~finally() { free(l); }
-    } finally{l};
-    size_t len = 0;
-    ssize_t n;
-    while ((n = getline(&l, &len, config)) != -1) {
-        if (n <= 1) continue;
-        std::string_view line{l, static_cast<size_t>(n)};
-        if (line.back() == '\n') {
-            line.remove_suffix(1);
-        }
-        auto d = line.find_first_of('=');
-        if (d == std::string_view::npos) {
-            LOGW("Ignore invalid line %.*s", static_cast<int>(line.size()), line.data());
-            continue;
-        }
-        auto key = line.substr(0, d);
-        trim(key);
-        auto value = line.substr(d + 1);
-        trim(value);
-        std::apply([&key, &value](auto &&... args) {
-            ((key == std::remove_cvref_t<decltype(args)>::getField() &&
-              (LOGD("Read config: %.*s = %.*s", static_cast<int>(key.size()), key.data(),
-                    static_cast<int>(value.size()), value.data()),
-                      args.value.size() >= value.size() + 1 ?
-                      (args.has_value = true,
-                              strlcpy(args.value.data(), value.data(),
-                                      std::min(args.value.size(), value.size() + 1))) :
-                      (LOGW("Config value %.*s for %.*s is too long, ignored",
-                            static_cast<int>(value.size()), value.data(),
-                            static_cast<int>(key.size()), key.data()), true))) || ...);
-        }, spoof_config);
+    if (dex) {
+        fseek(dex, 0, SEEK_END);
+        dexSize = ftell(dex);
+        fseek(dex, 0, SEEK_SET);
+
+        dexVector.resize(dexSize);
+        fread(dexVector.data(), 1, dexSize, dex);
+
+        fclose(dex);
     }
+
+    FILE *json = fopen(CUSTOM_JSON_FILE_PATH, "r");
+    if (!json)
+        json = fopen(JSON_FILE_PATH, "r");
+
+    if (json) {
+        fseek(json, 0, SEEK_END);
+        jsonSize = ftell(json);
+        fseek(json, 0, SEEK_SET);
+
+        jsonVector.resize(jsonSize);
+        fread(jsonVector.data(), 1, jsonSize, json);
+
+        fclose(json);
+    }
+
+    write(fd, &dexSize, sizeof(long));
+    write(fd, &jsonSize, sizeof(long));
+
+    write(fd, dexVector.data(), dexSize);
+    write(fd, jsonVector.data(), jsonSize);
+
+    dexVector.clear();
+    jsonVector.clear();
 }
 
-static void companion_handler(int fd) {
-    constexpr auto kSpoofConfigFile = "/data/adb/tricky_store/spoof_build_vars"sv;
-    constexpr auto kDefaultSpoofConfig =
-R"EOF(MANUFACTURER=Google
-MODEL=Pixel
-FINGERPRINT=google/sailfish/sailfish:10/QPP3.190404.015/5505587:user/release-keys
-BRAND=google
-PRODUCT=sailfish
-DEVICE=sailfish
-RELEASE=10
-ID=QPP3.190404.015
-INCREMENTAL=5505587
-TYPE=user
-TAGS=release-keys
-SECURITY_PATCH=2019-05-05
-)EOF"sv;
-    struct stat st{};
-    int enabled = stat(kSpoofConfigFile.data(), &st) == 0;
-    xwrite(fd, &enabled, sizeof(enabled));
+REGISTER_ZYGISK_MODULE(PlayIntegrityFix)
 
-    if (!enabled) {
-        return;
-    }
-
-    int cfd = -1;
-    if (st.st_size == 0) {
-        cfd = open(kSpoofConfigFile.data(), O_RDWR);
-        if (cfd > 0) {
-            xwrite(cfd, kDefaultSpoofConfig.data(), kDefaultSpoofConfig.size());
-            lseek(cfd, 0, SEEK_SET);
-        }
-    } else {
-        cfd = open(kSpoofConfigFile.data(), O_RDONLY);
-    }
-    if (cfd < 0) {
-        LOGE("[companion_handler] Failed to open spoof_build_vars");
-        return;
-    }
-
-    SpoofConfig spoof_config{};
-    std::unique_ptr<FILE, decltype([](auto *f) { fclose(f); })> config{fdopen(cfd, "r")};
-    read_config(config.get(), spoof_config);
-
-    xwrite(fd, &spoof_config, sizeof(spoof_config));
-}
-
-// Register our module class and the companion handler function
-REGISTER_ZYGISK_MODULE(TrickyStore)
-REGISTER_ZYGISK_COMPANION(companion_handler)
+REGISTER_ZYGISK_COMPANION(companion)
